@@ -1,4 +1,6 @@
 import socket
+import os
+from datetime import datetime
 
 def startServer():
     
@@ -15,22 +17,111 @@ def startServer():
         clientConnection, clientAddress = serverSocket.accept()
         print(f"Accepted connection from {clientAddress}")
 
-        request = clientConnection.recv(1024).decode('utf-8')
+        request = clientConnection.recv(1025).decode('utf-8')
         print(f"Received request:\n{request}")
 
-        body = "<html><body><h1>Server works</h1></body></html>"
+        if not request:
+            clientConnection.close()
+            continue
 
-        response = (
-                "HTTP/1.1 200 OK\r\n"
+        lines = request.splitlines()
+
+        requestLine = lines[0]
+
+        parts = requestLine.split(' ')
+
+        if len(parts) == 3:
+            method = parts[0]
+            path = parts[1]
+            version = parts[2]
+
+            print(f"Method: {method} | Path: {path} | Version: {version}")
+        else:
+            print("Malformed request received.")
+            clientConnection.close()
+            continue
+        
+        if version != "HTTP/1.1":
+            body = "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>"
+
+            response = (
+                "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+                "Content-Type: text/html\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "\r\n"
+                f"{body}")
+       
+            clientConnection.sendall(response.encode('utf-8'))
+            clientConnection.close()
+            continue            
+
+        if path.startswith('/'):
+            path = path[1:]
+
+        if path == "":
+            path = "test.html"
+
+        if os.path.isfile(path):
+            if os.access(path, os.R_OK):
+                clientDateString = None
+                for line in lines[1:]:
+                    if line.startswith("If-Modified-Since:"):
+                        clientDateString = line.split(":", 1)[1].strip()
+                        break
+                if clientDateString:
+                    try:
+                        browserTime = datetime.strptime(clientDateString, "%a, %d %b %Y %H:%M:%S GMT").timestamp()
+                        osTimeUtc = datetime.utcfromtimestamp(os.path.getmtime(path)).timestamp()
+
+                        if osTimeUtc <= browserTime:
+                            response = "HTTP/1.1 304 Not Modified\r\n\r\n"
+                            clientConnection.sendall(response.encode('utf-8'))
+                            clientConnection.close()
+                            continue                 
+                    except ValueError:
+                        pass
+                
+                with open(path) as file:
+                    body = file.read()
+
+                response = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/html\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "\r\n"
+                    f"{body}"
+                )
+                clientConnection.sendall(response.encode('utf-8'))
+                clientConnection.close()
+                continue
+
+            else:
+                body = "<html><body><h1>403 Forbidden</h1></body></html>"
+
+                response = (
+                    "HTTP/1.1 403 Forbidden\r\n"
+                    "Content-Type: text/html\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "\r\n"
+                    f"{body}")
+       
+                clientConnection.sendall(response.encode('utf-8'))
+                clientConnection.close()
+                continue 
+        else:
+            body = "<html><body><h1>404 Not Found</h1></body></html>"
+
+            response = (
+                "HTTP/1.1 404 Not Found\r\n"
                 "Content-Type: text/html\r\n"
                 f"Content-Length: {len(body)}\r\n"
                 "\r\n"
                 f"{body}"
-        )
-        
-        clientConnection.sendall(response.encode('utf-8'))
-        clientConnection.close()
+            )    
+       
+            clientConnection.sendall(response.encode('utf-8'))
+            clientConnection.close()
+            continue
 
 if __name__ == "__main__":
-    start_server()
-            
+    startServer()
