@@ -62,12 +62,16 @@ def startServer():
             path = "test.html"
 
         if os.path.isfile(path):
-            if os.access(path, os.R_OK):
+            try:
+                with open(path, 'r') as file:
+                    body = file.read()
+
                 clientDateString = None
                 for line in lines[1:]:
                     if line.startswith("If-Modified-Since:"):
                         clientDateString = line.split(":", 1)[1].strip()
                         break
+
                 if clientDateString:
                     try:
                         browserTime = datetime.strptime(clientDateString, "%a, %d %b %Y %H:%M:%S GMT").timestamp()
@@ -80,9 +84,6 @@ def startServer():
                             continue                 
                     except ValueError:
                         pass
-                
-                with open(path) as file:
-                    body = file.read()
 
                 response = (
                     "HTTP/1.1 200 OK\r\n"
@@ -95,9 +96,8 @@ def startServer():
                 clientConnection.close()
                 continue
 
-            else:
+            except PermissionError:
                 body = "<html><body><h1>403 Forbidden</h1></body></html>"
-
                 response = (
                     "HTTP/1.1 403 Forbidden\r\n"
                     "Content-Type: text/html\r\n"
