@@ -2,113 +2,140 @@ import socket
 import os
 from datetime import datetime
 import threading
+import struct
 
-def  handle_client(clientConnection, clientAddress):
-        try:
-            request = clientConnection.recv(1025).decode('utf-8')
-            print(f"Received request:\n{request}")
+FRAME_TYPE_HEADERS = 0x01
+FRAME_TYPE_DATA = 0x02
+FRAME_TYPE_END = 0x03
 
-            if not request:
-                return
+def send_frame(connection, lock, stream_id, frame_type, payload=b""):
+    length = len(payload)
+    header = struct.pack("!HBH", stream_id, frame_type, length)
+    with lock:
+        connection.sendall(header + payload)
 
-            lines = request.splitlines()
-            if not lines:
-                return
+def receive_frame(connection):
+    header_bytes = b""
+    while len(header_bytes) < 5:
+        chunk = connection.recv(5 - len(header_bytes))
+        if not chunk:
+            return None, None, None
+        header_bytes += chunk
+
+    stream_id, frame_type, length = struct.unpack("!HBH", header_bytes)
+
+    payload = b""
+    while len(payload) < length:
+         chunk = connection.recv(length - len(payload))
+         if not chunk:
+             break
+         payload += chunk
+
+    return stream_id, frame_type, payload
+
+def process_stream(clientConnection, send_lock, stream_id, request, if_modified_since=None):
+    try:
+        lines = request.splitlines()
+        if not lines:
+            return
+        
+        requestLine = lines[0]
+
+        parts = requestLine.split(' ')
+
+        if len(parts) == 3:
+            method, path, version = parts[0], parts[1], parts[2]
+
+            print(f"Method: {method} | Path: {path} | Version: {version}")
+        else:
+            print("Malformed request received.")
+            return
+        
+        if version != "HTTP/1.1":
+            body = "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>"
+            headers = f"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n".encode('utf-8')
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
+            return        
+
+        if path.startswith('/'):
+            path = path[1:]
+        if path == "":
+            path = "test.html"
+
+        if os.path.isfile(path):
+            try:
+                clientDateString = None
+                for line in lines[1:]:
+                    if line.startswith("If-Modified-Since:"):
+                        clientDateString = line.split(":", 1)[1].strip()
+                        break
+
+                if clientDateString:
+                    try:
+                        browserTime = datetime.strptime(clientDateString, "%a, %d %b %Y %H:%M:%S GMT").timestamp()
+                        osTimeUtc = datetime.utcfromtimestamp(os.path.getmtime(path)).timestamp()
+
+                        if osTimeUtc <= browserTime:
+                            response = "HTTP/1.1 304 Not Modified\r\n\r\n"
+                            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
+                            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
+                            return            
+                    except ValueError:
+                        pass
+
+                with open(path, 'rb') as file:
+                    body = file.read()
+
+                headers = f"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n".encode('utf-8')
+                send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
+                
+                chunk_size = 512
+                for i in range(0, len(body), chunk_size):
+                    chunk = body[i:i + chunk_size]
+                    send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, chunk)
+
+                send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
             
-            requestLine = lines[0]
+            except PermissionError:
+                body = b"<html><body><h1>403 Forbidden</h1></body></html>"
+                headers = f"HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n".encode('utf-8')
+                send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
+                send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
+                send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
+        else:
+            body = "<html><body><h1>404 Not Found</h1></body></html>"
+            headers = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n"
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
+            send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
+ 
+    except Exception as e:
+        print(f"[Stream {stream_id}] Error: {e}")
 
-            parts = requestLine.split(' ')
+def handle_multiplexed_client(connection, address):
+    send_lock = threading.Lock()
+    try:
+        while True:
+            stream_id, frame_type, payload = receive_frame(connection)
 
-            if len(parts) == 3:
-                method = parts[0]
-                path = parts[1]
-                version = parts[2]
+            if stream_id is None:
+                break
 
-                print(f"Method: {method} | Path: {path} | Version: {version}")
-            else:
-                print("Malformed request received.")
-                return
-            
-            if version != "HTTP/1.1":
-                body = "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>"
+            if frame_type == FRAME_TYPE_HEADERS:
+                request_str = payload.decode('utf-8', errors='ignore')
 
-                response = (
-                    "HTTP/1.1 505 HTTP Version Not Supported\r\n"
-                    "Content-Type: text/html\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "\r\n"
-                    f"{body}")
-        
-                clientConnection.sendall(response.encode('utf-8'))
-                return        
+                stream_thread = threading.Thread(
+                    target=process_stream,
+                    args=(connection, send_lock, stream_id, request_str)
+                )
+                stream_thread.start()
 
-            if path.startswith('/'):
-                path = path[1:]
-
-            if path == "":
-                path = "test.html"
-
-            if os.path.isfile(path):
-                try:
-                    with open(path, 'r') as file:
-                        body = file.read()
-
-                    clientDateString = None
-                    for line in lines[1:]:
-                        if line.startswith("If-Modified-Since:"):
-                            clientDateString = line.split(":", 1)[1].strip()
-                            break
-
-                    if clientDateString:
-                        try:
-                            browserTime = datetime.strptime(clientDateString, "%a, %d %b %Y %H:%M:%S GMT").timestamp()
-                            osTimeUtc = datetime.utcfromtimestamp(os.path.getmtime(path)).timestamp()
-
-                            if osTimeUtc <= browserTime:
-                                response = "HTTP/1.1 304 Not Modified\r\n\r\n"
-                                clientConnection.sendall(response.encode('utf-8'))
-                                return            
-                        except ValueError:
-                            pass
-
-                    response = (
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: text/html\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "\r\n"
-                        f"{body}"
-                    )
-                    clientConnection.sendall(response.encode('utf-8'))
-                    
-
-                except PermissionError:
-                    body = "<html><body><h1>403 Forbidden</h1></body></html>"
-                    response = (
-                        "HTTP/1.1 403 Forbidden\r\n"
-                        "Content-Type: text/html\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "\r\n"
-                        f"{body}")
-        
-                    clientConnection.sendall(response.encode('utf-8'))
-                    
-            else:
-                body = "<html><body><h1>404 Not Found</h1></body></html>"
-
-                response = (
-                    "HTTP/1.1 404 Not Found\r\n"
-                    "Content-Type: text/html\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "\r\n"
-                    f"{body}"
-                )    
-        
-                clientConnection.sendall(response.encode('utf-8'))
-        except Exception as e:
-            print(f"Error handling client {clientAddress}: {e}")
-        finally:
-            clientConnection.close()
-
+    except Exception as e:
+        print(f"Error handling connection {address}: {e}")
+    finally:
+        connection.close()
 
 def startServer():
     
@@ -126,10 +153,8 @@ def startServer():
         print(f"Accepted connection from {clientAddress}")
 
         #Create and start a new thread for each connection
-        client_thread = threading.Thread(target=handle_client, args=(clientConnection, clientAddress))
+        client_thread = threading.Thread(target=process_stream, args=(clientConnection, clientAddress))
         client_thread.start()
-
-
 
 if __name__ == "__main__":
     startServer()
