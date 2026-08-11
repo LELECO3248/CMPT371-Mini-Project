@@ -17,19 +17,25 @@ def send_frame(connection, lock, stream_id, frame_type, payload=b""):
 def receive_frame(connection):
     header_bytes = b""
     while len(header_bytes) < 5:
-        chunk = connection.recv(5 - len(header_bytes))
-        if not chunk:
+        try: 
+            chunk = connection.recv(5 - len(header_bytes))
+            if not chunk:
+                return None, None, None
+            header_bytes += chunk
+        except Exception:
             return None, None, None
-        header_bytes += chunk
 
     stream_id, frame_type, length = struct.unpack("!HBH", header_bytes)
 
     payload = b""
     while len(payload) < length:
-         chunk = connection.recv(length - len(payload))
-         if not chunk:
-             break
-         payload += chunk
+        try:
+            chunk = connection.recv(length - len(payload))
+            if not chunk:
+                break
+            payload += chunk
+        except Exception:
+            break
 
     return stream_id, frame_type, payload
 
@@ -40,19 +46,17 @@ def process_stream(clientConnection, send_lock, stream_id, request, if_modified_
             return
         
         requestLine = lines[0]
-
         parts = requestLine.split(' ')
 
         if len(parts) == 3:
             method, path, version = parts[0], parts[1], parts[2]
-
             print(f"Method: {method} | Path: {path} | Version: {version}")
         else:
             print("Malformed request received.")
             return
         
         if version != "HTTP/1.1":
-            body = "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>"
+            body = b"<html><body><h1>505 HTTP Version Not Supported</h1></body></html>"
             headers = f"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n".encode('utf-8')
             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
@@ -78,7 +82,7 @@ def process_stream(clientConnection, send_lock, stream_id, request, if_modified_
                         osTimeUtc = datetime.utcfromtimestamp(os.path.getmtime(path)).timestamp()
 
                         if osTimeUtc <= browserTime:
-                            response = "HTTP/1.1 304 Not Modified\r\n\r\n"
+                            headers = b"HTTP/1.1 304 Not Modified\r\n\r\n"
                             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
                             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
                             return            
@@ -105,8 +109,8 @@ def process_stream(clientConnection, send_lock, stream_id, request, if_modified_
                 send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
                 send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
         else:
-            body = "<html><body><h1>404 Not Found</h1></body></html>"
-            headers = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n"
+            body = b"<html><body><h1>404 Not Found</h1></body></html>"
+            headers = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\n\r\n".encode('utf-8')
             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_HEADERS, headers)
             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_DATA, body)
             send_frame(clientConnection, send_lock, stream_id, FRAME_TYPE_END, b"")
@@ -153,7 +157,7 @@ def startServer():
         print(f"Accepted connection from {clientAddress}")
 
         #Create and start a new thread for each connection
-        client_thread = threading.Thread(target=process_stream, args=(clientConnection, clientAddress))
+        client_thread = threading.Thread(target=handle_multiplexed_client, args=(clientConnection, clientAddress))
         client_thread.start()
 
 if __name__ == "__main__":
